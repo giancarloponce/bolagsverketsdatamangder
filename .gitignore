@@ -10,3 +10,6 @@ __pycache__/
 *.log
 factoring_errors.log
 factoring_leads.db
+factoring_leads.db-shm
+factoring_leads.db-wal
+financials/
