@@ -170,8 +170,11 @@ def worker_main(database: str, proxy: str, worker_number: int) -> None:
                 )
                 connection.commit()
                 print(
-                    f"{worker} row={row_index + 1} {lead.get('orgnr', '')} "
-                    f"{result.get('match_status')} {result.get('kontakt_telefon', '')}",
+                    f"{worker} row={row_index + 1} "
+                    f"orgnr={lead.get('orgnr', '')} "
+                    f"bolag={result.get('bolag_namn', '')} "
+                    f"telefon={result.get('kontakt_telefon', '')} "
+                    f"status={result.get('match_status')}",
                     flush=True,
                 )
                 time.sleep(DELAY_SECONDS)
