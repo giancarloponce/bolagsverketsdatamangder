@@ -40,6 +40,10 @@ from phone_enrichment_test import (  # noqa: E402
     write_live_proxies,
 )
 
+# Keep the aggressive mode capped so an accidental higher CLI value cannot
+# create an unbounded number of Chromium processes on the VPS.
+MAX_WORKERS = max(1, min(10, (os.cpu_count() or 2) * 5))
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
     row_index INTEGER PRIMARY KEY,
@@ -242,7 +246,7 @@ def main() -> int:
     parser.add_argument("--resume-output", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--database", type=Path, required=True)
-    parser.add_argument("--workers", type=int, default=10)
+    parser.add_argument("--workers", type=int, default=MAX_WORKERS)
     parser.add_argument("--reset", action="store_true")
     args = parser.parse_args()
 
@@ -251,7 +255,7 @@ def main() -> int:
     args.database.parent.mkdir(parents=True, exist_ok=True)
     prepare_jobs(args.database, leads, existing, args.reset)
     proxies = resolve_proxies()
-    worker_count = min(max(1, args.workers), len(proxies))
+    worker_count = min(max(1, args.workers), MAX_WORKERS, len(proxies))
     print(f"Startar {worker_count} workers med {len(proxies)} live-proxies", flush=True)
     processes = [
         mp.Process(target=worker_main, args=(str(args.database), proxies[index], index + 1))
