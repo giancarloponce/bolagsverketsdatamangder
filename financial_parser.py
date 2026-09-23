@@ -1,225 +1,245 @@
+#!/usr/bin/env python3
+"""Utilities for parsing financial reports from nested ZIP/iXBRL files."""
+
+from __future__ import annotations
+
+import io
 import re
-from typing import Dict, List, Optional
+import zipfile
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional
 
-from html import unescape
+from bs4 import BeautifulSoup
 
-FINANCIAL_LABELS = {
-    "omsattning": [
-        "omsättning", "omsattning", "nettoomsättning", "nettoomsattning", "intäkter", "försäljning",
-        "se-gen-base:nettoomsattning", "se-gen-base:nettoomsättning", "nettoomsattning"
-    ],
-    "resultat": [
-        "resultat", "nettoresultat", "rörelseresultat", "resultat efter finansiella poster",
-        "se-gen-base:resultatafterfinansiellaposter", "se-gen-base:resultatefterfinansiellaposter",
-        "resultatefterfinansiellaposter"
-    ],
-    "balansomslutning": [
-        "balansomslutning", "totala tillgångar", "totala tillgångar", "tillgångar",
-        "se-gen-base:tillgangar", "se-gen-base:totala tillgångar", "tillgangar"
-    ],
-    "kundfordringar": [
-        "kundfordringar", "fordringar på kunder", "kundfordringar och fordringar",
-        "se-gen-base:kundfordringar", "se-gen-base:fordringar", "kundfordringar"
-    ],
-    "kassalikviditet": [
-        "kassalikviditet", "likviditet", "cash ratio", "se-gen-base:kassamedel", "se-gen-base:likviditet", "kassamedel"
-    ],
-    "kortfristiga_skulder": [
-        "kortfristiga skulder", "kortfristiga skulder och upplupna kostnader",
-        "se-gen-base:kortfristigaskulder", "se-gen-base:kortfristiga skulder", "kortfristigaskulder"
-    ],
-    "varulager": ["varulager", "lager", "se-gen-base:varulager", "varulager"],
-    "eget_kapital": ["eget kapital", "eget kapital och reserver", "se-gen-base:egetkapital", "egetkapital"],
+HTML_EXTENSIONS = (".html", ".htm", ".xhtml", ".ixbrl", ".xml")
+
+METRIC_ALIASES = {
+    "omsattning": {
+        "nettoomsattning",
+        "omsattning",
+        "nettoomsättning",
+        "omsättning",
+    },
+    "resultat": {
+        "resultatefterfinansiellaposter",
+        "resultat",
+        "resultatefterfinansiella",
+        "resultatefterfinansiella",
+    },
+    "balansomslutning": {
+        "tillgangar",
+        "tillgångar",
+        "totaltillgangar",
+        "totala tillgångar",
+        "balansomslutning",
+    },
+    "kundfordringar": {"kundfordringar"},
+    "kassalikviditet": {"kassamedel", "kassalikviditet"},
+    "kortfristiga_skulder": {"kortfristigaskulder", "kortfristiga_skulder", "kortfristiga_skulder"},
+    "varulager": {"varulager"},
+    "eget_kapital": {"egetkapital", "eget_kapital", "aktiekapital", "egetkapital"},
 }
 
 
-def normalize_whitespace(value: Optional[str]) -> str:
+def _normalize_metric_name(value: str) -> str:
     if value is None:
         return ""
-    return re.sub(r"\s+", " ", str(value)).strip()
+    cleaned = str(value)
+    cleaned = cleaned.split(":")[-1]
+    cleaned = cleaned.replace("_", "").replace("-", "").replace(" ", "")
+    return re.sub(r"[^a-zåäö0-9]", "", cleaned.lower())
 
 
-def _normalize_alias(value: str) -> str:
-    value = unescape(value or "")
-    mapping = {"å": "a", "ä": "a", "ö": "o", "Å": "a", "Ä": "a", "Ö": "o"}
-    normalized = "".join(mapping.get(ch, ch) for ch in value.lower())
-    normalized = re.sub(r"[^a-z0-9]", "", normalized)
-    return normalized
-
-
-def normalize_orgnr(value: Optional[str]) -> Optional[str]:
+def parse_numeric(value) -> Optional[float]:
     if value is None:
         return None
-    cleaned = str(value).replace("-", "").replace(" ", "").strip()
-    if not cleaned:
-        return None
-    return cleaned
+    if isinstance(value, (int, float)):
+        return float(value)
 
-
-def normalize_year(value: Optional[str]) -> Optional[int]:
-    if value is None:
-        return None
     text = str(value).strip()
-    matches = re.findall(r"(\d{4})", text)
-    if not matches:
-        return None
-    return int(matches[0])
-
-
-def parse_numeric(value: Optional[str]) -> Optional[float]:
-    if value is None:
+    if not text or text.lower() in {"nan", "none", "null"}:
         return None
 
-    cleaned = normalize_whitespace(value)
-    cleaned = cleaned.replace("\xa0", "")
-    cleaned = re.sub(r"(?i)\b(?:sek|kr|eur|usd|gbp)\b", "", cleaned)
-    cleaned = cleaned.replace("%", "")
-    cleaned = cleaned.replace(" ", "")
-    cleaned = cleaned.strip("\t\r\n;:()[]{}")
+    text = text.replace("\xa0", " ").replace("_", "")
+    text = text.strip()
+    if text.endswith("%"):
+        text = text[:-1].strip()
 
-    if not cleaned:
-        return None
-
-    sign = 1
-    if cleaned.startswith("-"):
-        sign = -1
-        cleaned = cleaned[1:]
-    elif cleaned.startswith("+"):
-        cleaned = cleaned[1:]
-    elif cleaned.startswith("(") and cleaned.endswith(")"):
-        sign = -1
-        cleaned = cleaned[1:-1]
-
-    if not re.search(r"\d", cleaned):
-        return None
-
-    if "," in cleaned and "." in cleaned:
-        if cleaned.rfind(",") > cleaned.rfind("."):
-            cleaned = cleaned.replace(".", "").replace(",", ".")
+    text = text.replace(" ", "")
+    if "," in text and "." in text:
+        if text.rfind(",") > text.rfind("."):
+            text = text.replace(".", "").replace(",", ".")
         else:
-            cleaned = cleaned.replace(",", "")
-    elif "," in cleaned:
-        parts = cleaned.split(",")
-        if len(parts) > 1 and len(parts[-1]) <= 2:
-            cleaned = ".".join(parts)
+            text = text.replace(",", "")
+    elif "," in text:
+        if text.count(",") > 1:
+            text = text.replace(".", "").replace(",", ".")
         else:
-            cleaned = "".join(parts)
-    elif "." in cleaned:
-        parts = cleaned.split(".")
-        if len(parts) > 1 and len(parts[-1]) <= 2 and len(parts) == 2:
-            cleaned = ".".join(parts)
-        else:
-            cleaned = "".join(parts)
-
-    cleaned = re.sub(r"[^0-9.-]", "", cleaned)
-    if cleaned in {"", ".", "-", "-."}:
-        return None
+            text = text.replace(",", ".")
+    elif "." in text and text.count(".") > 1:
+        text = text.replace(".", "")
 
     try:
-        return sign * float(cleaned)
+        return float(text)
     except ValueError:
         return None
 
 
-def _match_metric(name: str, aliases: List[str]) -> bool:
-    norm_name = _normalize_alias(name)
-    for alias in aliases:
-        if norm_name == _normalize_alias(alias):
-            return True
-        if _normalize_alias(alias) in norm_name or norm_name in _normalize_alias(alias):
-            return True
-    return False
+def _iter_html_chunks(payload: bytes) -> Iterable[tuple[str, bytes]]:
+    with zipfile.ZipFile(io.BytesIO(payload)) as outer_zip:
+        for member in outer_zip.infolist():
+            name_lower = member.filename.lower()
+            if name_lower.endswith(".zip"):
+                inner_bytes = outer_zip.read(member)
+                try:
+                    for inner_name, inner_bytes_value in _iter_html_chunks(inner_bytes):
+                        yield inner_name, inner_bytes_value
+                except zipfile.BadZipFile:
+                    continue
+            elif any(name_lower.endswith(ext) for ext in HTML_EXTENSIONS):
+                yield member.filename, outer_zip.read(member)
 
 
-def _extract_metric_from_xbrl(html_text: str, aliases: List[str]) -> Optional[float]:
-    pattern = re.compile(r'<ix:nonFraction\b[^>]*name="([^"]+)"[^>]*>(.*?)</ix:nonFraction>', re.IGNORECASE | re.DOTALL)
-    for match in pattern.finditer(html_text):
-        name, value = match.groups()
-        if _match_metric(name, aliases):
-            numeric = parse_numeric(value)
-            if numeric is not None:
-                return numeric
+def _extract_orgnr_from_html(html_text: str) -> Optional[str]:
+    candidates = re.findall(r"\b\d{6}[-\s]?\d{4}\b", html_text)
+    if candidates:
+        return re.sub(r"\D", "", candidates[0])
+
+    match = re.search(r"Organisationsnummer.*?(\d{6}[-\s]?\d{4})", html_text, flags=re.IGNORECASE | re.DOTALL)
+    if match:
+        return re.sub(r"\D", "", match.group(1))
+
+    numbers = re.findall(r"\b\d{10,12}\b", html_text)
+    if numbers:
+        return re.sub(r"\D", "", numbers[0])
     return None
 
 
-def extract_financials_from_html(html_text: str) -> Dict[str, object]:
-    results: Dict[str, object] = {}
+def _extract_year_from_html(html_text: str) -> Optional[int]:
+    matches = re.findall(r"\b(\d{4})-(\d{2})-(\d{2})\b", html_text)
+    if matches:
+        year = int(matches[0][0])
+        return year
 
-    for key, aliases in FINANCIAL_LABELS.items():
-        value = _extract_metric_from_xbrl(html_text, aliases)
-        if value is not None:
-            results[key] = value
-
-    orgnr = None
-    for pattern in [r'<xbrli:identifier[^>]*>(\d{10,12})</xbrli:identifier>', r'<se-ar-base:Organisationsnummer[^>]*>(\d{10,12})</se-ar-base:Organisationsnummer>', r'(\d{10,12})']:
-        matches = re.findall(pattern, html_text)
-        for match in matches:
-            candidate = normalize_orgnr(match)
-            if candidate and len(candidate) >= 10:
-                orgnr = candidate
-                break
-        if orgnr:
-            break
-
-    if orgnr:
-        results["orgnr"] = orgnr
-
-    year = None
-    for pattern in [
-        r'<xbrli:endDate[^>]*>(\d{4}-\d{2}-\d{2})</xbrli:endDate>',
-        r'\b(\d{4})-(\d{2})-(\d{2})\b',
-        r'\b(\d{4})\b'
-    ]:
-        matches = re.findall(pattern, html_text)
-        if matches:
-            value = matches[0]
-            if isinstance(value, tuple):
-                year_text = value[0]
-            else:
-                year_text = value
-            year_candidate = normalize_year(year_text)
-            if year_candidate and 2000 <= year_candidate <= 2100:
-                year = year_candidate
-                break
-
-    if year:
-        results["year"] = year
-
-    return results
+    matches = re.findall(r"\b(\d{4})\b", html_text)
+    if matches:
+        for value in matches:
+            if value.startswith("20"):
+                return int(value)
+    return None
 
 
-def extract_financials_from_zip_bytes(zip_bytes: bytes) -> List[Dict[str, object]]:
-    records: List[Dict[str, object]] = []
-    try:
-        from io import BytesIO
-        import zipfile
+def _extract_metrics_from_soup(soup: BeautifulSoup) -> Dict[str, float]:
+    metrics: Dict[str, float] = {}
+    seen = set()
 
-        with zipfile.ZipFile(BytesIO(zip_bytes)) as zf:
-            for name in zf.namelist():
-                if not name.lower().endswith(".zip"):
-                    continue
-                try:
-                    inner_bytes = zf.read(name)
-                except Exception:
-                    continue
-                try:
-                    with zipfile.ZipFile(BytesIO(inner_bytes)) as inner_zip:
-                        for inner_name in inner_zip.namelist():
-                            if not inner_name.lower().endswith((".xhtml", ".html", ".htm", ".xml")):
-                                continue
-                            try:
-                                content = inner_zip.read(inner_name)
-                                text = content.decode("utf-8", errors="ignore")
-                            except Exception:
-                                continue
-                            if not text:
-                                continue
-                            record = extract_financials_from_html(text)
-                            if record and record.get("orgnr") and record.get("year"):
-                                records.append(record)
-                except Exception:
-                    continue
-    except Exception:
+    for tag in soup.find_all("ix:nonFraction"):
+        metric_name = tag.get("name")
+        if not metric_name:
+            continue
+        canonical = _normalize_metric_name(metric_name)
+        for field, aliases in METRIC_ALIASES.items():
+            allowed = {_normalize_metric_name(alias) for alias in aliases}
+            if canonical in allowed:
+                value = parse_numeric(tag.get_text(" ", strip=True))
+                if value is not None:
+                    metrics[field] = value
+                    seen.add(field)
+
+    if not metrics:
+        for tag in soup.find_all(attrs={"name": True}):
+            metric_name = tag.get("name")
+            canonical = _normalize_metric_name(metric_name)
+            if not canonical:
+                continue
+            for field, aliases in METRIC_ALIASES.items():
+                allowed = {_normalize_metric_name(alias) for alias in aliases}
+                if canonical in allowed:
+                    value = parse_numeric(tag.get_text(" ", strip=True))
+                    if value is not None and field not in seen:
+                        metrics[field] = value
+                        seen.add(field)
+
+    return metrics
+
+
+def _build_record_from_html_text(html_text: str) -> Optional[dict]:
+    if not html_text:
+        return None
+
+    orgnr = _extract_orgnr_from_html(html_text)
+    year = _extract_year_from_html(html_text)
+    if not orgnr or not year:
+        return None
+
+    soup = BeautifulSoup(html_text, "html.parser")
+    metrics = _extract_metrics_from_soup(soup)
+    if not metrics:
+        return None
+
+    return {
+        "orgnr": orgnr,
+        "year": year,
+        "omsattning": metrics.get("omsattning"),
+        "resultat": metrics.get("resultat"),
+        "balansomslutning": metrics.get("balansomslutning"),
+        "kundfordringar": metrics.get("kundfordringar"),
+        "kassalikviditet": metrics.get("kassalikviditet"),
+        "kortfristiga_skulder": metrics.get("kortfristiga_skulder"),
+        "varulager": metrics.get("varulager"),
+        "eget_kapital": metrics.get("eget_kapital"),
+    }
+
+
+def extract_financials_from_zip_bytes(payload: bytes) -> List[dict]:
+    """Return parsed financial records from a ZIP archive or a raw XHTML file."""
+    if not payload:
         return []
 
+    try:
+        if not zipfile.is_zipfile(io.BytesIO(payload)):
+            html_text = payload.decode("utf-8", errors="replace")
+            record = _build_record_from_html_text(html_text)
+            return [record] if record else []
+    except Exception:
+        html_text = payload.decode("utf-8", errors="replace")
+        record = _build_record_from_html_text(html_text)
+        return [record] if record else []
+
+    records: List[dict] = []
+
+    for _, file_bytes in _iter_html_chunks(payload):
+        try:
+            html_text = file_bytes.decode("utf-8", errors="replace")
+        except Exception:
+            continue
+
+        record = _build_record_from_html_text(html_text)
+        if record is not None:
+            records.append(record)
+
     return records
+
+
+def main():
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Parse nested ZIP/XHTML financial reports")
+    parser.add_argument("--zip", type=str, help="ZIP file to inspect")
+    args = parser.parse_args()
+
+    if not args.zip:
+        parser.error("--zip is required")
+
+    zip_path = Path(args.zip)
+    if not zip_path.exists():
+        raise FileNotFoundError(zip_path)
+
+    records = extract_financials_from_zip_bytes(zip_path.read_bytes())
+    print(f"Found {len(records)} financial records")
+    for record in records[:5]:
+        print(record)
+
+
+if __name__ == "__main__":
+    main()

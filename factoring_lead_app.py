@@ -5,6 +5,8 @@ import sqlite3
 import requests
 import os
 import glob
+import threading
+import time
 from io import BytesIO
 from datetime import datetime
 import logging
@@ -159,14 +161,134 @@ def log_to_db(conn, source, level, message):
                  (datetime.now().isoformat(), source, level, message))
     conn.commit()
 
+LOAD_STATUS = {
+    "title": "Väntar",
+    "detail": "",
+    "progress": 0,
+    "running": False,
+    "done": False,
+    "error": None,
+    "df": None,
+    "started_at": None,
+    "current_file": None,
+    "processed_count": 0,
+    "total_count": 0,
+}
+
+
+def _set_load_status(title, detail=None, progress=0, current_file=None, processed_count=None, total_count=None):
+    LOAD_STATUS["title"] = title
+    LOAD_STATUS["detail"] = detail or ""
+    LOAD_STATUS["progress"] = max(0, min(int(progress), 100))
+    if current_file is not None:
+        LOAD_STATUS["current_file"] = current_file
+    if processed_count is not None:
+        LOAD_STATUS["processed_count"] = int(processed_count)
+    if total_count is not None:
+        LOAD_STATUS["total_count"] = int(total_count)
+    if LOAD_STATUS.get("started_at") is None:
+        LOAD_STATUS["started_at"] = datetime.now()
+
+
+def _update_load_status(progress_bar, status_text, percentage, title, detail=None, current_file=None, processed_count=None, total_count=None):
+    _set_load_status(title, detail, percentage, current_file=current_file, processed_count=processed_count, total_count=total_count)
+    if progress_bar is not None:
+        progress_bar.progress(min(max(percentage, 0), 100))
+    if status_text is not None:
+        status_text.empty()
+        status_text.markdown(f"**{title}**")
+        if detail:
+            status_text.write(detail)
+
+
+def _render_load_status():
+    progress = LOAD_STATUS.get("progress", 0)
+    st.progress(progress)
+    st.markdown(f"**{LOAD_STATUS.get('title', 'Laddar')}**")
+    detail = LOAD_STATUS.get("detail")
+    if detail:
+        st.caption(detail)
+
+    current_file = LOAD_STATUS.get("current_file")
+    if current_file:
+        st.code(f"Aktuell fil: {current_file}")
+
+    processed = LOAD_STATUS.get("processed_count")
+    total = LOAD_STATUS.get("total_count")
+    if processed is not None or total is not None:
+        st.caption(f"Bearbetat: {processed if processed is not None else 0} / {total if total is not None else 0} steg")
+
+    started_at = LOAD_STATUS.get("started_at")
+    if started_at is not None and not LOAD_STATUS.get("done"):
+        elapsed = (datetime.now() - started_at).total_seconds()
+        eta_seconds = None
+        if progress > 0:
+            eta_seconds = max(0, int((elapsed / max(progress, 1)) * (100 - progress)))
+        if eta_seconds is not None:
+            st.caption(f"Tid sedan start: {int(elapsed)} s • Beräknad återstående tid: {eta_seconds} s")
+        else:
+            st.caption(f"Tid sedan start: {int(elapsed)} s")
+
+    step_map = {
+        "Startar dataladdning": "1. Initierar applikationen",
+        "Läser lokala finansiella ZIP-filer": "2. Kollar om lokala ZIP-filer finns",
+        "Importerar finansiella uppgifter": "3. Bearbetar lokala finansiella filer",
+        "Nedladdning": "4. Hämtar extern bulkdata",
+        "Förbereder": "5. Förbereder ZIP-innehåll",
+        "Bearbetar": "6. Läser CSV/ZIP i chunks",
+        "Importerar": "7. Sparar data i databasen",
+        "Förbereder lead-data": "8. Bygger lead-dataset",
+        "Databas uppdaterad": "9. Klart",
+        "Klar": "9. Klart",
+    }
+    headline = LOAD_STATUS.get("title", "")
+    if headline in step_map:
+        st.caption(f"Steg: {step_map[headline]}")
+
+
+def _download_with_retry(url, headers=None, timeout=300, max_retries=3):
+    headers = headers or {}
+    last_error = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = requests.get(url, headers=headers, stream=True, timeout=timeout)
+            if response.status_code == 200:
+                return response
+            last_error = RuntimeError(f"HTTP {response.status_code}")
+        except Exception as exc:  # pragma: no cover - network path only
+            last_error = exc
+        if attempt < max_retries:
+            time.sleep(2 * attempt)
+    raise last_error or RuntimeError(f"Download failed for {url}")
+
+
 @st.cache_data(ttl=3600)
 def load_data(force_download=False, min_age=3):
+    start_time = datetime.now()
+    LOAD_STATUS["started_at"] = start_time
     conn = get_db_connection()
     create_error_log_table(conn)
     create_financials_table(conn)
 
+    _update_load_status(None, None, 2, "Startar dataladdning", "Initierar databas och verifierar cache-status")
+
     financial_paths = sorted(glob.glob(os.path.join("financials", "*.zip")))
-    for path in financial_paths:
+    total_local_files = len(financial_paths)
+    if financial_paths:
+        _update_load_status(None, None, 5, "Läser lokala finansiella ZIP-filer", f"Hittade {total_local_files} filer i mappen financials", current_file="financials/", processed_count=0, total_count=total_local_files)
+
+    for index, path in enumerate(financial_paths, start=1):
+        filename = os.path.basename(path)
+        _update_load_status(
+            None,
+            None,
+            5 + int((index / max(total_local_files, 1)) * 25),
+            "Importerar finansiella uppgifter",
+            f"{index}/{total_local_files}: bearbetar {filename}",
+            current_file=filename,
+            processed_count=index,
+            total_count=total_local_files,
+        )
         import_financial_zip_file(conn, path)
 
     last_update = get_last_update(conn)
@@ -178,30 +300,72 @@ def load_data(force_download=False, min_age=3):
             "bolagsverket": "https://vardefulla-datamangder.bolagsverket.se/bolagsverket/bolagsverket_bulkfil.zip"
         }
 
-        progress_bar = st.progress(0)
-        status_text = st.empty()
         total_steps = len(urls) * 4
         current_step = 0
 
         for name, url in urls.items():
             try:
-                logger.info(f"[{name}] Downloading...")
-                status_text.text(f"Laddar ner {name}...")
-                progress_bar.progress(int((current_step / total_steps) * 100))
+                filename = url.rsplit("/", 1)[-1]
+                logger.info(f"[{name}] Downloading {filename}...")
+                _update_load_status(
+                    None,
+                    None,
+                    30 + int((current_step / max(total_steps, 1)) * 50),
+                    f"Nedladdning: {name}",
+                    f"Hämtar {filename} från {url}",
+                    current_file=filename,
+                    processed_count=current_step,
+                    total_count=total_steps,
+                )
                 current_step += 1
 
                 headers = {"User-Agent": "Mozilla/5.0"}
-                response = requests.get(url, headers=headers, stream=True, timeout=300)
+                try:
+                    response = _download_with_retry(url, headers=headers, timeout=300, max_retries=3)
+                except Exception as exc:
+                    _update_load_status(
+                        None,
+                        None,
+                        30 + int((current_step / max(total_steps, 1)) * 50),
+                        f"Nedladdning misslyckades för {name}",
+                        f"{exc}",
+                    )
+                    raise
 
                 if response.status_code != 200:
+                    _update_load_status(
+                        None,
+                        None,
+                        30 + int((current_step / max(total_steps, 1)) * 50),
+                        f"Hoppar över {name}",
+                        f"HTTP {response.status_code} från datakälla",
+                    )
                     continue
 
-                progress_bar.progress(int((current_step / total_steps) * 100))
+                _update_load_status(
+                    None,
+                    None,
+                    30 + int((current_step / max(total_steps, 1)) * 50),
+                    f"Förbereder {name}",
+                    f"Läser nedladdat ZIP-innehåll från {filename}",
+                    current_file=filename,
+                    processed_count=current_step,
+                    total_count=total_steps,
+                )
                 current_step += 1
 
                 zip_content = BytesIO(response.content)
 
-                progress_bar.progress(int((current_step / total_steps) * 100))
+                _update_load_status(
+                    None,
+                    None,
+                    30 + int((current_step / max(total_steps, 1)) * 50),
+                    f"Bearbetar {name}",
+                    f"Läser CSV/ZIP i chunks från {filename}",
+                    current_file=filename,
+                    processed_count=current_step,
+                    total_count=total_steps,
+                )
                 current_step += 1
 
                 if name == "scb":
@@ -213,13 +377,31 @@ def load_data(force_download=False, min_age=3):
                                          compression="zip", low_memory=False, quotechar='"',
                                          escapechar="\\", on_bad_lines="skip", chunksize=50000)
 
+                chunk_index = 0
                 for chunk in reader:
+                    chunk_index += 1
                     chunk.columns = [c.strip().lower().replace(" ", "_") for c in chunk.columns]
                     create_companies_table(conn, chunk.columns)
                     chunk.to_sql("companies", conn, if_exists="append", index=False, chunksize=5000)
+                    _update_load_status(
+                        None,
+                        None,
+                        30 + int((current_step / max(total_steps, 1)) * 50) + min(10, int((chunk_index / max(1, chunk_index + 1)) * 10)),
+                        f"Importerar {name}",
+                        f"Bearbetade chunk {chunk_index} i {filename}",
+                        current_file=filename,
+                        processed_count=chunk_index,
+                        total_count=max(chunk_index, 1),
+                    )
 
                 logger.info(f"[{name}] Import finished")
-                progress_bar.progress(int((current_step / total_steps) * 100))
+                _update_load_status(
+                    None,
+                    None,
+                    80 + int((current_step / max(total_steps, 1)) * 20),
+                    f"Klar: {name}",
+                    "Datakälla importerad",
+                )
                 current_step += 1
                 st.success(f"Importerade {name}")
 
@@ -230,9 +412,15 @@ def load_data(force_download=False, min_age=3):
                 st.error(f"Fel vid {name}")
 
         set_last_update(conn, datetime.now())
-        progress_bar.progress(100)
-        status_text.text("Databas uppdaterad!")
-        st.balloons()
+        _update_load_status(None, None, 100, "Databas uppdaterad", "Alla datakällor är nu importerade")
+    else:
+        _update_load_status(
+            None,
+            None,
+            25,
+            "Använder lokal cache",
+            "Databasen är nyligen uppdaterad, så inga stora nedladdningar körs nu",
+        )
 
     query = f"""
         SELECT 
@@ -255,6 +443,7 @@ def load_data(force_download=False, min_age=3):
               ) >= {min_age * 365}
         LIMIT 50000
     """
+    _update_load_status(None, None, 90, "Förbereder lead-data", "Läser och filtrerar företagsdata")
     df = pd.read_sql(query, conn)
     conn.close()
 
@@ -265,7 +454,16 @@ def load_data(force_download=False, min_age=3):
     if 'organisationsform' in df.columns:
         df['sni'] = df['organisationsform'].fillna('')
 
+    elapsed = datetime.now() - start_time
+    _update_load_status(
+        None,
+        None,
+        100,
+        "Klar",
+        f"{len(df) if df is not None else 0} företag laddade på {elapsed.total_seconds():.0f} sekunder",
+    )
     return df
+
 
 def calculate_score(row):
     score = 15
@@ -355,6 +553,40 @@ def calculate_score(row):
     return max(0, min(100, score))
 
 
+def _start_background_refresh(force_download=False, min_age=3):
+    if "refresh_thread" in st.session_state and st.session_state["refresh_thread"].is_alive():
+        return
+
+    def worker():
+        try:
+            st.session_state["last_status_rerun"] = 0
+            LOAD_STATUS["running"] = True
+            LOAD_STATUS["done"] = False
+            LOAD_STATUS["error"] = None
+            df = load_data(force_download=force_download, min_age=min_age)
+            LOAD_STATUS["df"] = df
+            LOAD_STATUS["done"] = True
+            LOAD_STATUS["running"] = False
+            st.session_state["last_status_rerun"] = 0
+        except Exception as exc:  # pragma: no cover - runtime path only
+            LOAD_STATUS["error"] = str(exc)
+            LOAD_STATUS["running"] = False
+            LOAD_STATUS["done"] = True
+            st.session_state["last_status_rerun"] = 0
+
+    thread = threading.Thread(target=worker, daemon=True)
+    st.session_state["refresh_thread"] = thread
+    thread.start()
+
+
+def _trigger_refresh(force_download=False, min_age=3):
+    st.session_state.pop("refresh_thread", None)
+    st.session_state.pop("data_loaded", None)
+    st.session_state.pop("df_cache", None)
+    LOAD_STATUS["df"] = None
+    _start_background_refresh(force_download=force_download, min_age=min_age)
+
+
 def main():
     st.set_page_config(page_title="Factoring Lead Generator", layout="wide")
     st.title("🇸🇪 Factoring & Fakturaköp – Lead Generator & BI (Optimerad)")
@@ -375,8 +607,49 @@ def main():
     min_age = st.sidebar.slider("Minsta bolagsålder (år)", 0, 30, 3)
     force_download = st.sidebar.checkbox("Tvinga ny nedladdning", value=False)
 
-    df = load_data(force_download=force_download, min_age=min_age)
+    if st.sidebar.button("🔄 Uppdatera data nu"):
+        _trigger_refresh(force_download=force_download, min_age=min_age)
 
+    if "refresh_thread" not in st.session_state or not st.session_state["refresh_thread"].is_alive():
+        if not st.session_state.get("data_loaded", False):
+            _start_background_refresh(force_download=force_download, min_age=min_age)
+
+    if "refresh_thread" in st.session_state and st.session_state["refresh_thread"].is_alive():
+        _render_load_status()
+        st.caption("Databasen uppdateras i bakgrunden. Du kan lämna sidan öppen medan processen körs.")
+        now = time.time()
+        last_rerun = st.session_state.get("last_status_rerun", 0)
+        if now - last_rerun >= 1.0:
+            st.session_state["last_status_rerun"] = now
+            st.rerun()
+        return
+
+    last_update = None
+    try:
+        conn = get_db_connection()
+        last_update = get_last_update(conn)
+        conn.close()
+    except Exception:
+        last_update = None
+
+    if last_update:
+        st.sidebar.caption(f"Senast uppdaterad: {last_update.strftime('%Y-%m-%d %H:%M')}")
+    else:
+        st.sidebar.caption("Senast uppdaterad: aldrig")
+
+    if LOAD_STATUS.get("error"):
+        st.error(f"Datainläsning misslyckades: {LOAD_STATUS['error']}")
+        return
+
+    df = LOAD_STATUS.get("df")
+    if df is None:
+        if st.session_state.get("data_loaded"):
+            df = st.session_state.get("df_cache")
+        else:
+            df = load_data(force_download=force_download, min_age=min_age)
+
+    st.session_state["data_loaded"] = True
+    st.session_state["df_cache"] = df
     if df.empty:
         st.error("Ingen data. Kontrollera loggen eller kör med force_download=True.")
         return
