@@ -1,0 +1,55 @@
+import re
+from playwright.sync_api import Playwright, sync_playwright, expect
+
+
+def run(playwright: Playwright) -> None:
+    browser = playwright.chromium.launch(headless=False)
+    context = browser.new_context()
+    page = context.new_page()
+    page.goto("https://www.trustpilot.com/")
+    page.get_by_role("button", name="Accept all").click()
+    page.get_by_role("searchbox", name="search input field").click()
+    page.get_by_role("searchbox", name="search input field").fill("eurofinans")
+    page.get_by_role("searchbox", name="search input field").press("Enter")
+    page.get_by_role("button", name="Search company or category").click()
+    page.get_by_role("link", name="Euro Finans AB eurofinans.se").click()
+    page.get_by_role("link", name="Reviews", exact=True).click()
+    page.get_by_role("button", name="Most recent").click()
+    page.get_by_role("button", name="Most recent").click()
+    page.get_by_role("button", name="More filters").click()
+    page.locator(".CDS_Modal_overlay__10984d").click()
+    page.get_by_role("button", name="Close").press("Escape")
+    page.get_by_role("button", name="Most recent").click()
+    page.get_by_role("button", name="Most recent").click()
+    page.get_by_role("link", name="Reviews", exact=True).click()
+    page.get_by_role("button", name="More filters").click()
+    page.get_by_role("radio", name="svenska").check()
+    page.get_by_role("radio", name="svenska").press("Enter")
+    page.get_by_role("radio", name="svenska").press("ControlOrMeta+-")
+    page.get_by_role("radio", name="svenska").press("ControlOrMeta+-")
+    page.get_by_role("radio", name="svenska").press("ControlOrMeta+-")
+    page.get_by_role("radio", name="svenska").press("ControlOrMeta+-")
+    page.get_by_role("radio", name="svenska").press("ControlOrMeta+-")
+    page.get_by_role("radio", name="svenska").press("ControlOrMeta+-")
+    page.get_by_test_id("filter-reviews").get_by_text("svenska").click()
+    page.get_by_role("radio", name="svenska").check()
+    page.get_by_role("button", name="Close").click()
+    page.get_by_role("button", name="Most recent").click()
+    page.get_by_role("button", name="More filters").click()
+    page.get_by_test_id("filter-reviews").get_by_text("svenska").dblclick()
+    page.get_by_role("radio", name="svenska").check()
+    page.get_by_role("button", name="More filters").click()
+    page.get_by_text("All languagessvenskaEnglishdefaultnorskdanskpolski").click()
+    page.get_by_role("radio", name="svenska").check()
+    page.get_by_role("radio", name="svenska").press("ControlOrMeta+-")
+    page.get_by_role("radio", name="svenska").press("ControlOrMeta+-")
+    page.get_by_role("radio", name="svenska").press("ControlOrMeta+-")
+    page.close()
+
+    # ---------------------
+    context.close()
+    browser.close()
+
+
+with sync_playwright() as playwright:
+    run(playwright)

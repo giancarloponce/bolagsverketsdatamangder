@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.venv/
+leads.db
+scraper.log
+trustpilot_hits.csv

@@ -8,12 +8,15 @@ import csv
 import json
 import multiprocessing as mp
 import os
+import shutil
 import sqlite3
 import sys
 import time
+from tempfile import mkdtemp
 from pathlib import Path
 from typing import Dict, List
 
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -32,6 +35,7 @@ from phone_enrichment_test import (  # noqa: E402
     PROXY_VALIDATE_TIMEOUT,
     PROXY_VALIDATE_URL,
     PROXY_LIST_URL,
+        SKIP_PROXY_PREFLIGHT,
     empty_result,
     find_hitta_company,
     load_proxies,
@@ -43,6 +47,12 @@ from phone_enrichment_test import (  # noqa: E402
 # Keep the aggressive mode capped so an accidental higher CLI value cannot
 # create an unbounded number of Chromium processes on the VPS.
 MAX_WORKERS = max(1, min(10, (os.cpu_count() or 2) * 5))
+CONTEXT_ROTATE_EVERY = 25
+FULL_BROWSER_RESTART_EVERY = 50
+WORKER_STALE_SECONDS = 180
+WATCHDOG_INTERVAL_SECONDS = 15
+WORKER_TMP_ROOT = Path(os.environ.get("PHONE_ENRICHMENT_TMPDIR", "/tmp/phone-enrichment-workers"))
+MIN_FREE_SPACE_MB = int(os.environ.get("PHONE_ENRICHMENT_MIN_FREE_MB", "300"))
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
@@ -125,54 +135,160 @@ def claim_job(connection: sqlite3.Connection, worker: str):
     return row
 
 
+def ensure_disk_space(path: Path) -> None:
+    free_bytes = shutil.disk_usage(path).free
+    minimum_bytes = MIN_FREE_SPACE_MB * 1024 * 1024
+    if free_bytes < minimum_bytes:
+        free_mb = free_bytes / (1024 * 1024)
+        raise RuntimeError(
+            f"För lite ledigt utrymme i {path}: {free_mb:.0f} MB kvar, "
+            f"minst {MIN_FREE_SPACE_MB} MB krävs"
+        )
+
+
+def cleanup_stale_worker_dirs() -> None:
+    WORKER_TMP_ROOT.mkdir(parents=True, exist_ok=True)
+    cutoff = time.time() - 24 * 60 * 60
+    for path in WORKER_TMP_ROOT.glob("worker-*"):
+        try:
+            if path.is_dir() and path.stat().st_mtime < cutoff:
+                shutil.rmtree(path, ignore_errors=True)
+        except OSError:
+            pass
+
+
 def process_lead(page, lead: Dict[str, str], worker: str) -> Dict[str, str]:
     orgnr = "".join(ch for ch in lead.get("orgnr", "") if ch.isdigit())
-    result = empty_result(lead, "error:unprocessed")
-    for attempt in range(1, MAX_ATTEMPTS + 1):
-        try:
-            result.update(find_hitta_company(page, orgnr))
-            return result
-        except Exception as exc:
-            if attempt == MAX_ATTEMPTS:
-                return empty_result(lead, f"error:{type(exc).__name__}")
-            backoff = BACKOFF_SECONDS[attempt - 1]
-            print(f"{worker} {orgnr}: {type(exc).__name__}, försök {attempt}/{MAX_ATTEMPTS}; väntar {backoff:.0f}s", flush=True)
-            time.sleep(backoff)
+    result = empty_result(lead, "error:unknown")
+    result.update(find_hitta_company(page, orgnr))
     return result
 
 
-def worker_main(database: str, proxy: str, worker_number: int) -> None:
+def worker_main(database: str, proxies: List[str], worker_number: int) -> None:
     worker = f"worker-{worker_number}-{os.getpid()}"
     connection = connect(Path(database))
     context = None
     browser = None
+    worker_tmp = None
+    proxy_index = (worker_number - 1) % len(proxies)
     try:
+        cleanup_stale_worker_dirs()
+        worker_tmp = Path(mkdtemp(prefix=f"worker-{os.getpid()}-", dir=WORKER_TMP_ROOT))
+        os.environ["TMPDIR"] = str(worker_tmp)
+        os.environ["TMP"] = str(worker_tmp)
+        os.environ["TEMP"] = str(worker_tmp)
+        ensure_disk_space(worker_tmp)
         with sync_playwright() as playwright:
-            launch_options = {"headless": True, "args": BROWSER_ARGS}
-            if BROWSER_EXECUTABLE:
-                launch_options["executable_path"] = BROWSER_EXECUTABLE
-            browser = playwright.chromium.launch(**launch_options)
-            context = new_context(browser, proxy)
+            def launch_browser():
+                launch_options = {"headless": True, "args": BROWSER_ARGS}
+                if BROWSER_EXECUTABLE:
+                    launch_options["executable_path"] = BROWSER_EXECUTABLE
+                return playwright.chromium.launch(**launch_options)
+
+            browser = launch_browser()
+            context = new_context(browser, proxies[proxy_index])
             page = context.new_page()
             page.set_default_timeout(INTERACTION_TIMEOUT_MS)
+            processed = 0
+
+            def rotate_proxy() -> None:
+                nonlocal context, page, proxy_index
+                page.close()
+                context.close()
+                proxy_index = (proxy_index + 1) % len(proxies)
+                context = new_context(browser, proxies[proxy_index])
+                page = context.new_page()
+                page.set_default_timeout(INTERACTION_TIMEOUT_MS)
+
+            def reset_context() -> None:
+                nonlocal browser, context, page
+                try:
+                    page.close()
+                except Exception:
+                    pass
+                try:
+                    context.close()
+                except Exception:
+                    pass
+                if not browser.is_connected():
+                    try:
+                        browser.close()
+                    except Exception:
+                        pass
+                    browser = launch_browser()
+                context = new_context(browser, proxies[proxy_index])
+                page = context.new_page()
+                page.set_default_timeout(INTERACTION_TIMEOUT_MS)
+
+            def restart_browser() -> None:
+                nonlocal browser, context, page
+                try:
+                    page.close()
+                except Exception:
+                    pass
+                try:
+                    context.close()
+                except Exception:
+                    pass
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+                browser = launch_browser()
+                context = new_context(browser, proxies[proxy_index])
+                page = context.new_page()
+                page.set_default_timeout(INTERACTION_TIMEOUT_MS)
+
             while True:
+                ensure_disk_space(worker_tmp)
                 claimed = claim_job(connection, worker)
                 if claimed is None:
                     break
                 row_index, lead_json, _attempts = claimed
                 lead = json.loads(lead_json)
-                result = process_lead(page, lead, worker)
-                if result.get("match_status", "").startswith("error:"):
-                    page.close()
-                    context.close()
-                    context = new_context(browser, proxy)
-                    page = context.new_page()
-                    page.set_default_timeout(INTERACTION_TIMEOUT_MS)
+                orgnr = "".join(ch for ch in lead.get("orgnr", "") if ch.isdigit())
+                result = empty_result(lead, "error:unknown")
+                last_error = "UnknownError"
+                for attempt in range(1, MAX_ATTEMPTS + 1):
+                    try:
+                        result = process_lead(page, lead, worker)
+                        break
+                    except PlaywrightTimeoutError:
+                        last_error = "TimeoutError"
+                        print(
+                            f"{worker} {orgnr}: timeout på proxy {proxy_index + 1}/{len(proxies)}; "
+                            "byter proxy direkt",
+                            flush=True,
+                        )
+                        rotate_proxy()
+                    except Exception as exc:
+                        last_error = type(exc).__name__
+                        target_closed = type(exc).__name__ == "TargetClosedError"
+                        reset_context()
+                        if target_closed:
+                            print(
+                                f"{worker} {orgnr}: target stängt; byggde om context och försöker igen",
+                                flush=True,
+                            )
+                            continue
+                        if attempt == MAX_ATTEMPTS:
+                            result = empty_result(lead, f"error:{type(exc).__name__}")
+                            break
+                        backoff = BACKOFF_SECONDS[attempt - 1]
+                        print(
+                            f"{worker} {orgnr}: {type(exc).__name__}, försök {attempt}/{MAX_ATTEMPTS}; "
+                            f"väntar {backoff:.0f}s",
+                            flush=True,
+                        )
+                        time.sleep(backoff)
+                if result.get("match_status") == "error:unknown":
+                    result = empty_result(lead, f"error:{last_error}")
                 connection.execute(
                     "UPDATE jobs SET result_json = ?, status = 'done', updated_at = CURRENT_TIMESTAMP WHERE row_index = ? AND worker = ?",
                     (json.dumps(result), row_index, worker),
                 )
                 connection.commit()
+                processed += 1
                 print(
                     f"{worker} row={row_index + 1} "
                     f"orgnr={lead.get('orgnr', '')} "
@@ -181,17 +297,29 @@ def worker_main(database: str, proxy: str, worker_number: int) -> None:
                     f"status={result.get('match_status')}",
                     flush=True,
                 )
+                if processed % CONTEXT_ROTATE_EVERY == 0:
+                    reset_context()
+                if processed % FULL_BROWSER_RESTART_EVERY == 0:
+                    restart_browser()
                 time.sleep(DELAY_SECONDS)
     finally:
         if context is not None:
-            context.close()
+            try:
+                context.close()
+            except Exception:
+                pass
         if browser is not None:
-            browser.close()
+            try:
+                browser.close()
+            except Exception:
+                pass
         connection.close()
+        if worker_tmp is not None:
+            shutil.rmtree(worker_tmp, ignore_errors=True)
 
 
 def resolve_proxies() -> List[str]:
-    if PROXY_LIVE_FILE and Path(PROXY_LIVE_FILE).exists():
+    if PROXY_LIVE_FILE and not SKIP_PROXY_PREFLIGHT and Path(PROXY_LIVE_FILE).exists():
         proxies = [line.strip() for line in Path(PROXY_LIVE_FILE).read_text(encoding="utf-8").splitlines() if line.strip()]
         if proxies:
             print(f"Återanvänder {len(proxies)} tidigare live-proxies", flush=True)
@@ -201,6 +329,9 @@ def resolve_proxies() -> List[str]:
     print(f"Laddade {len(candidates)} proxykandidater från {PROXY_LIST_URL}", flush=True)
     if not candidates:
         raise RuntimeError("Inga proxykandidater hittades")
+    if SKIP_PROXY_PREFLIGHT:
+        print("Hoppar över proxy-preflight; roterar vidare vid timeout", flush=True)
+        return candidates
     with sync_playwright() as playwright:
         launch_options = {"headless": True, "args": BROWSER_ARGS}
         if BROWSER_EXECUTABLE:
@@ -240,6 +371,31 @@ def export_results(database: Path, output: Path, leads: List[Dict[str, str]]) ->
     connection.close()
 
 
+def reset_worker_claims(database: Path, worker: str) -> int:
+    connection = connect(database)
+    connection.execute(
+        "UPDATE jobs SET status = 'pending', worker = NULL, updated_at = CURRENT_TIMESTAMP "
+        "WHERE status = 'claimed' AND worker = ?",
+        (worker,),
+    )
+    reset = connection.total_changes
+    connection.commit()
+    connection.close()
+    return reset
+
+
+def stale_workers(database: Path) -> List[str]:
+    connection = connect(database)
+    rows = connection.execute(
+        "SELECT DISTINCT worker FROM jobs "
+        "WHERE status = 'claimed' AND worker IS NOT NULL "
+        "AND (julianday('now') - julianday(updated_at)) * 86400 > ?",
+        (WORKER_STALE_SECONDS,),
+    ).fetchall()
+    connection.close()
+    return [row[0] for row in rows]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Parallell och återupptagningsbar Hitta-berikning")
     parser.add_argument("--input", type=Path, required=True)
@@ -257,15 +413,39 @@ def main() -> int:
     proxies = resolve_proxies()
     worker_count = min(max(1, args.workers), MAX_WORKERS, len(proxies))
     print(f"Startar {worker_count} workers med {len(proxies)} live-proxies", flush=True)
-    processes = [
-        mp.Process(target=worker_main, args=(str(args.database), proxies[index], index + 1))
-        for index in range(worker_count)
-    ]
-    for process in processes:
+    processes = {}
+    failed_exitcodes = []
+
+    def start_worker(worker_number: int) -> None:
+        process = mp.Process(target=worker_main, args=(str(args.database), proxies, worker_number))
         process.start()
-    for process in processes:
-        process.join()
-    if any(process.exitcode for process in processes):
+        processes[worker_number] = process
+
+    for worker_number in range(1, worker_count + 1):
+        start_worker(worker_number)
+
+    while processes:
+        time.sleep(WATCHDOG_INTERVAL_SECONDS)
+        stale = set(stale_workers(args.database))
+        for worker_number, process in list(processes.items()):
+            worker_prefix = f"worker-{worker_number}-"
+            worker_names = [worker for worker in stale if worker.startswith(worker_prefix)]
+            if worker_names and process.is_alive():
+                print(
+                    f"Watchdog: {worker_names[0]} har varit stale i över "
+                    f"{WORKER_STALE_SECONDS}s; startar om worker",
+                    flush=True,
+                )
+                process.terminate()
+                process.join(timeout=10)
+                reset_worker_claims(args.database, worker_names[0])
+                start_worker(worker_number)
+            elif not process.is_alive():
+                process.join()
+                if process.exitcode:
+                    failed_exitcodes.append(process.exitcode)
+                del processes[worker_number]
+    if failed_exitcodes:
         raise RuntimeError("Minst en worker avslutades med fel; kör samma kommando igen för resume")
     export_results(args.database, args.output, leads)
     print(f"Klar: {args.output}", flush=True)
