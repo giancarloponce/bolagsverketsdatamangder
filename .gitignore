@@ -13,3 +13,12 @@ factoring_leads.db
 factoring_leads.db-shm
 factoring_leads.db-wal
 financials/
+proxys.txt
+proxyscrape_premium_*.txt
+test_leads_100.csv
+.download_state.json
+.runtime/
+trustpilot_scraper/exports/
+trustpilot_scraper/leads.db*
+trustpilot_scraper/runs/
+bolagsverketsdatamängder.code-workspace
